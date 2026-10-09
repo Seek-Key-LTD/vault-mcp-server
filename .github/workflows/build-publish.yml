@@ -1,0 +1,180 @@
+name: build-publish
+
+# Seek-Key-LTD vault-mcp-server 自维护构建分发管线
+# 标准 = AMD64 架构 × 2 版本 = 2 包
+# 产物发布 Cloudflare R2: s3://dist/vault-mcp-server/ -> https://bin.seekkey.cc.cd/vault-mcp-server/
+# 架构覆盖：linux-amd64
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '版本号（含 v 前缀，如 v1.0.0；留空自动推导）'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build (linux-amd64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: .go-version
+          cache: true
+
+      - name: Resolve Version
+        id: ver
+        run: |
+          INPUT_VER="${{ github.event.inputs.version }}"
+          if [ -n "$INPUT_VER" ]; then
+            V="$INPUT_VER"
+          elif [ "${{ github.ref_type }}" = "tag" ]; then
+            V="${{ github.ref_name }}"
+          elif [ -f version/VERSION ]; then
+            V="v$(cat version/VERSION | tr -d ' \n\r')"
+          elif [ -f version/version.go ]; then
+            CODE_VER=$(awk -F'"' '/Version[[:space:]]*=/ {print $2; exit}' version/version.go)
+            V="v${CODE_VER:-dev}"
+          else
+            V="vdev"
+          fi
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "Building version: $V"
+
+      - name: Compile binary
+        env:
+          GOOS: linux
+          GOARCH: amd64
+          CGO_ENABLED: 0
+          FULL_VER: ${{ steps.ver.outputs.version }}
+        run: |
+          mkdir -p dist
+          BIN_NAME="vault-mcp-server-linux-amd64"
+          GIT_COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+          BUILD_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+          LDFLAGS="-s -w"
+
+          echo "Compiling $BIN_NAME for linux/amd64..."
+          go build -trimpath -ldflags "$LDFLAGS" -o "dist/$BIN_NAME" ./cmd/vault-mcp-server
+
+          ls -lh "dist/$BIN_NAME"
+          file "dist/$BIN_NAME" || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vault-mcp-server-linux-amd64
+          path: dist/vault-mcp-server-linux-amd64
+
+  publish:
+    name: publish & verify
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: 'vault-mcp-server-*'
+          path: dist
+          merge-multiple: true
+
+      - name: Resolve publish version
+        id: ver
+        run: |
+          INPUT_VER="${{ github.event.inputs.version }}"
+          if [ -n "$INPUT_VER" ]; then
+            V="$INPUT_VER"
+          elif [ "${{ github.ref_type }}" = "tag" ]; then
+            V="${{ github.ref_name }}"
+          elif [ -f version/VERSION ]; then
+            V="v$(cat version/VERSION | tr -d ' \n\r')"
+          elif [ -f version/version.go ]; then
+            CODE_VER=$(awk -F'"' '/Version[[:space:]]*=/ {print $2; exit}' version/version.go)
+            V="v${CODE_VER:-dev}"
+          else
+            V="vdev"
+          fi
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "VERSION=$V" >> "$GITHUB_ENV"
+          echo "Publishing version: $V"
+
+      - name: Generate Checksums
+        run: |
+          cd dist
+          ls -lh
+          for f in vault-mcp-server-*; do
+            sha256sum "$f" | awk '{print $1"  "$2}' > "$f.sha256"
+          done
+          sha256sum vault-mcp-server-* > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Upload to Cloudflare R2 (AWS CLI, SigV4)
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+        run: |
+          EP="${{ secrets.R2_ENDPOINT }}"
+          B="s3://${{ secrets.R2_BUCKET }}/vault-mcp-server"
+          name="vault-mcp-server-linux-amd64"
+          echo "Uploading $name to $B/$VERSION/linux/amd64/"
+          aws s3 cp "dist/$name"        "$B/$VERSION/linux/amd64/$name" --endpoint-url "$EP"
+          aws s3 cp "dist/$name.sha256" "$B/$VERSION/linux/amd64/$name.sha256" --endpoint-url "$EP"
+          aws s3 cp dist/SHA256SUMS "$B/$VERSION/SHA256SUMS" --endpoint-url "$EP"
+
+      - name: Verify remote SHA256 (key-agent standard)
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+        run: |
+          EP="${{ secrets.R2_ENDPOINT }}"
+          B="s3://${{ secrets.R2_BUCKET }}/vault-mcp-server"
+          mkdir -p /tmp/verify
+          name="vault-mcp-server-linux-amd64"
+          aws s3 cp "$B/$VERSION/linux/amd64/$name.sha256" "/tmp/verify/$name.sha256" --endpoint-url "$EP"
+          aws s3 cp "$B/$VERSION/linux/amd64/$name"        "/tmp/verify/$name"        --endpoint-url "$EP"
+          (cd /tmp/verify && sha256sum -c "$name.sha256")
+          echo "✓ Artifact verified on remote R2"
+
+      - name: Retention — keep current + previous (1×2=2)
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+        run: |
+          EP="${{ secrets.R2_ENDPOINT }}"
+          B="s3://${{ secrets.R2_BUCKET }}/vault-mcp-server"
+          VERSIONS=$(aws s3 ls "$B/" --endpoint-url "$EP" | awk '{print $2}' | grep -E '^v?[0-9]' | sed 's#/##' | sort -V)
+          echo "Existing versions: $VERSIONS"
+          KEEP=2
+          OLD=$(echo "$VERSIONS" | head -n -$KEEP || true)
+          if [ -n "$OLD" ]; then
+            for v in $OLD; do
+              echo "PRUNE: aws s3 rm $B/$v/ --recursive"
+              aws s3 rm "$B/$v/" --recursive --endpoint-url "$EP"
+            done
+          fi
+          echo "✓ Retention applied, kept latest $KEEP versions"
+
+      - name: Distribution summary
+        run: |
+          DOMAIN="${{ secrets.R2_PUBLIC_DOMAIN }}"
+          name="vault-mcp-server-linux-amd64"
+          echo "### Release Binary Published Successfully 🚀" >> $GITHUB_STEP_SUMMARY
+          echo "Version: \`$VERSION\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| OS | Arch | Binary URL | Checksum URL |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| linux | amd64 | [$name]($DOMAIN/vault-mcp-server/$VERSION/linux/amd64/$name) | [$name.sha256]($DOMAIN/vault-mcp-server/$VERSION/linux/amd64/$name.sha256) |" >> $GITHUB_STEP_SUMMARY
+          echo "| All | All | [SHA256SUMS]($DOMAIN/vault-mcp-server/$VERSION/SHA256SUMS) | - |" >> $GITHUB_STEP_SUMMARY
